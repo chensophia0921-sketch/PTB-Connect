@@ -1,16 +1,43 @@
-create type public.app_role as enum ('admin','manager','staff');
-create table public.profiles (id uuid primary key references auth.users(id) on delete cascade, full_name text not null, role app_role not null default 'staff', created_at timestamptz default now());
-create table public.clients (id uuid primary key default gen_random_uuid(), name text unique not null, hourly_rate numeric default 0, active boolean default true, created_at timestamptz default now());
-create table public.time_entries (id uuid primary key default gen_random_uuid(), user_id uuid references auth.users(id) on delete cascade not null, client_id uuid references public.clients(id), work_date date not null, job_name text not null, hours numeric not null check (hours > 0), billable boolean default true, work_details text, status text default 'submitted', created_at timestamptz default now());
-alter table public.profiles enable row level security; alter table public.clients enable row level security; alter table public.time_entries enable row level security;
-create or replace function public.current_role() returns app_role language sql security definer stable as $$ select role from public.profiles where id = auth.uid() $$;
-create policy "read own profile" on public.profiles for select using (id = auth.uid() or public.current_role() in ('admin','manager'));
-create policy "admin update profiles" on public.profiles for all using (public.current_role()='admin') with check (public.current_role()='admin');
-create policy "staff read clients" on public.clients for select using (auth.role()='authenticated');
-create policy "manager admin edit clients" on public.clients for all using (public.current_role() in ('admin','manager')) with check (public.current_role() in ('admin','manager'));
-create policy "read entries by role" on public.time_entries for select using (user_id = auth.uid() or public.current_role() in ('admin','manager'));
-create policy "insert own entries" on public.time_entries for insert with check (user_id = auth.uid());
-create policy "update own or manager" on public.time_entries for update using (user_id = auth.uid() or public.current_role() in ('admin','manager')) with check (user_id = auth.uid() or public.current_role() in ('admin','manager'));
-create policy "delete manager admin" on public.time_entries for delete using (public.current_role() in ('admin','manager'));
-create or replace function public.handle_new_user() returns trigger language plpgsql security definer as $$ begin insert into public.profiles (id, full_name, role) values (new.id, coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email,'@',1)), 'staff'); return new; end; $$;
-create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
+create table if not exists profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text,
+  email text,
+  role text default 'staff' check (role in ('admin','manager','staff')),
+  created_at timestamptz default now()
+);
+create table if not exists clients (
+  id uuid primary key default gen_random_uuid(),
+  name text unique not null,
+  created_at timestamptz default now()
+);
+create table if not exists time_entries (
+  id uuid primary key default gen_random_uuid(),
+  date date not null,
+  staff_id uuid references profiles(id) on delete cascade not null,
+  client_id uuid references clients(id) on delete restrict not null,
+  job_name text not null,
+  hours numeric(6,2) not null check (hours > 0),
+  details text,
+  billable boolean default true,
+  created_at timestamptz default now()
+);
+alter table profiles enable row level security;
+alter table clients enable row level security;
+alter table time_entries enable row level security;
+create policy "profiles read own or manager" on profiles for select using (auth.uid() = id or exists (select 1 from profiles p where p.id=auth.uid() and p.role in ('admin','manager')));
+create policy "clients read all logged in" on clients for select using (auth.role()='authenticated');
+create policy "clients insert logged in" on clients for insert with check (auth.role()='authenticated');
+create policy "time read own or manager" on time_entries for select using (staff_id=auth.uid() or exists (select 1 from profiles p where p.id=auth.uid() and p.role in ('admin','manager')));
+create policy "time insert own" on time_entries for insert with check (staff_id=auth.uid());
+create policy "time update own" on time_entries for update using (staff_id=auth.uid());
+create policy "time delete own" on time_entries for delete using (staff_id=auth.uid());
+create or replace function public.handle_new_user() returns trigger as $$
+begin
+  insert into public.profiles (id, email, full_name, role)
+  values (new.id, new.email, coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email,'@',1)), 'staff')
+  on conflict (id) do nothing;
+  return new;
+end;
+$$ language plpgsql security definer;
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.handle_new_user();
